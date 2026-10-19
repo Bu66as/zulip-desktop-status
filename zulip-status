@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Michael Maurer
+"""Set Zulip presence and status text from the state of the desktop.
+
+Runs as a systemd user service. Credentials come from ~/.zuliprc ([api] email,
+key, site). As long as there is no key in it, the service only waits.
+
+Presence:
+  unlocked            -> visible + "active"
+  locked >= N min     -> invisible (presence_enabled off)
+  outside work hours  -> invisible, even when unlocked
+
+Status (first matching line wins):
+  sick / vacation by command        -> Sick [until DD.MM.] / On vacation until ...
+  set by command (see below)        -> Break / Focusing until HH:MM
+  all-day vacation event            -> On vacation until ...
+  event running in the calendar     -> In a meeting until HH:MM
+  unlocked, work hours, home net    -> Working from home
+  unlocked, work hours, elsewhere   -> On the road
+  unlocked, otherwise               -> empty
+  locked >= N min, work hours       -> Away
+  locked / service stop, otherwise  -> Off work, back at ...
+
+Before suspend and hibernate (lid closed) the service delays sleep for a moment
+and sets Away or Off work and invisible, because the machine cannot report
+anything afterwards. Break/Focusing and vacation stay.
+
+Settings: ~/.config/zulip-status/config.env (KEY=value), environment variables
+of the same name win. ZULIP_STATUS_LANG=de|en selects the language of status
+texts and messages (default: from the locale).
+
+Optional calendar: ~/.config/zulip-status/kalender ([caldav] url, user,
+password). Without it there is no meeting and no vacation status.
+
+Optional dead man's switch: ~/.config/zulip-status/waechter ([waechter] url,
+token). The service then reports to that server every round; see
+docs/watchdog.md. Without the file nothing is sent anywhere but Zulip.
+
+Break and focus are chosen by the user:
+  zulip-status pause [MIN]   break; with MIN until that time, without until
+                             the next unlock after a lock
+  zulip-status fokus [MIN]   focusing; without MIN until end of work
+  zulip-status krank [YYYY-MM-DD]   sick; with a date up to and including
+                             that day, without until 'zulip-status auto'
+  zulip-status urlaub YYYY-MM-DD    on vacation up to and including that day
+  zulip-status auto          back to automatic
+
+Sick and vacation also hold while the machine is off: sleep and service stop
+leave the status in place, and so does the watchdog.
+
+A status set by hand in Zulip stays. It is only cleared at the first unlock of
+a new day, a status with the emoji "hurt" (sick) never.
+"""
+import base64
+import configparser
+import datetime
+import ipaddress
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+KONFIG = os.path.expanduser("~/.config/zulip-status/config.env")
+
+
+def einstellungen():
+    """KEY=value aus KONFIG; gleichnamige Umgebungsvariablen gewinnen."""
+    werte = {}
+    try:
+        with open(KONFIG) as fh:
+            for zeile in fh:
+                zeile = zeile.strip()
+                if zeile and not zeile.startswith("#") and "=" in zeile:
+                    name, wert = zeile.split("=", 1)
+                    werte[name.strip()] = wert.strip().strip('"')
+    except OSError:
+        pass
+    werte.update({k: v for k, v in os.environ.items() if k.startswith("ZULIP_STATUS_")})
+    return werte
+
+
+def sprache(cfg):
+    wahl = cfg.get("ZULIP_STATUS_LANG") or next(
+        (os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
+    return "de" if wahl.lower().startswith("de") else "en"
+
+
+CFG = einstellungen()
+SPRACHE = sprache(CFG)
+RC = os.path.expanduser("~/.zuliprc")
+KALENDER_RC = os.path.expanduser("~/.config/zulip-status/kalender")
+MERKER = os.path.expanduser("~/.local/state/zulip-status.json")
+HAND = os.path.expanduser("~/.local/state/zulip-status-hand.json")
+WAECHTER_RC = os.path.expanduser("~/.config/zulip-status/waechter")
+WAECHTER_GUELTIG = 300       # so lange gilt ein Lebenszeichen beim Waechter
+WAECHTER_ABSCHIED = 20       # vor Schlaf/Dienstende: der Waechter uebernimmt gleich
+DIENST = "zulip-status.service"
+TAKT = 60
+SICHTBAR_NEU = 600           # presence_enabled spaetestens so oft neu setzen
+KALENDER_TAKT = 300
+PLATZHALTER = ("HIER_", "YOUR_")
+VON = CFG.get("ZULIP_STATUS_VON", "08:00")
+BIS = CFG.get("ZULIP_STATUS_BIS", "16:30")
+UNSICHTBAR_NACH = int(CFG.get("ZULIP_STATUS_UNSICHTBAR_MIN", "5")) * 60
+HEIMNETZE = [ipaddress.ip_network(n) for n in CFG.get("ZULIP_STATUS_HEIMNETZE", "").split() if n]
+URLAUB_WORT = CFG.get("ZULIP_STATUS_URLAUB_WORT", "urlaub" if SPRACHE == "de" else "vacation").lower()
+TROCKEN = "--dry-run" in sys.argv
+
+# (Emoji-Name, Unicode-Codepunkt) wie im Zulip-Dialog "Status setzen"
+EMOJI = {
+    "haus": ("house", "1f3e0"),
+    "unterwegs": ("bus", "1f68c"),
+    "meeting": ("calendar", "1f4c5"),
+    "urlaub": ("palm_tree", "1f334"),
+    "krank": ("hurt", "1f915"),
+    "pause": ("coffee", "2615"),
+    "fokus": ("headphones", "1f3a7"),
+    "abwesend": ("walking", "1f6b6"),
+    "feierabend": ("moon", "1f319"),
+}
+BLEIBT_IMMER = ("hurt",)     # Emoji-Namen, die nie weggeraeumt werden (Krank)
+LEER = ("", "")
+
+# Status-Texte und Meldungen; Auswahl ueber ZULIP_STATUS_LANG
+TEXTE = {
+    "de": {
+        "pause": "Pause", "fokus": "Konzentriert", "bis": "{name} bis {zeit}",
+        "urlaub": "Im Urlaub bis {tag}", "datum": "%d.%m.",
+        "meeting": "Im Meeting bis {zeit}",
+        "haus": "Arbeitet von zu Hause", "unterwegs": "Unterwegs", "abwesend": "Abwesend",
+        "feierabend_anfang": "Feierabend, wieder da ab ",
+        "feierabend": "Feierabend, wieder da ab {von}",
+        "feierabend_tag": "Feierabend, wieder da ab {tag} {von}",
+        "wochentage": ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
+        "kal_fehlt": "kein Kalenderzugang in {pfad}, Meeting/Urlaub entfallen",
+        "kal_weg": "Kalender nicht erreichbar ({e}), nutze letzten Stand",
+        "kal_gelesen": "Kalender gelesen: {n} Termine, {g} ganztaegig",
+        "w_da": "Waechter erreichbar", "w_code": "Waechter antwortet {code}",
+        "w_weg": "Waechter nicht erreichbar: {e}",
+        "sichtbar": "Anwesenheit sichtbar", "unsichtbar": "Anwesenheit unsichtbar",
+        "hand_bleibt": "Status von Hand gesetzt ('{text}'), bleibt",
+        "hand_weg": "Handeintrag vom Vortag ('{text}') weggeraeumt",
+        "status": "Status: '{text}'", "status_leer": "Status geloescht",
+        "beendet": "{name} beendet",
+        "keine_sitzung": "keine grafische Sitzung, nichts zu tun",
+        "gesperrt": "gesperrt", "entsperrt": "entsperrt", "kein_status": "kein Status",
+        "schlaf": "Rechner geht schlafen",
+        "wache_aus": "Schlafwache nicht aktiv: {e}", "wache_alt": "Schlafwache nicht erneuert: {e}",
+        "sperrgrund": "Zulip-Status vor dem Schlafen setzen",
+        "cli_auto": "Zulip-Status folgt wieder der Automatik.",
+        "cli_aufruf": "Aufruf: zulip-status {art} [MINUTEN]",
+        "cli_bis": "{name} bis {zeit}.",
+        "cli_pause": "Pause, bis du nach einer Sperre wieder entsperrst (spaetestens Arbeitsende).",
+        "cli_fokus": "Konzentriert bis Arbeitsende oder 'zulip-status auto'.",
+        "schlaf_fehler": "Vor dem Schlafen nicht gesetzt: {e}",
+        "kein_schluessel": "kein Schluessel in {pfad}, warte",
+        "zulip_code": "Zulip antwortet {code}: {text}", "zulip_weg": "Zulip nicht erreichbar: {e}",
+        "ende_fehler": "Abschluss nicht gesetzt: {e}",
+        "krank": "Krank", "krank_bis": "Krank bis {tag}",
+        "krank_ende": "Krank beendet", "urlaub_ende": "Urlaub beendet",
+        "keine_sitzung_ende": "keine Sitzung in diesem Lauf, kein Abschied noetig",
+        "freigabe_fehler": "Schlaf-Freigabe nicht geschrieben: {e}",
+        "cli_tag_aufruf": "Aufruf: zulip-status {art} JJJJ-MM-TT (heute oder spaeter)",
+        "cli_urlaub_aufruf": "Aufruf: zulip-status urlaub JJJJ-MM-TT",
+        "cli_urlaub": "Im Urlaub bis {tag}, auch wenn der Rechner aus ist.",
+        "cli_krank_bis": "Krank bis {tag}, auch wenn der Rechner aus ist.",
+        "cli_krank": "Krank bis 'zulip-status auto', auch wenn der Rechner aus ist.",
+    },
+    "en": {
+        "pause": "Break", "fokus": "Focusing", "bis": "{name} until {zeit}",
+        "urlaub": "On vacation until {tag}", "datum": "%d %b",
+        "meeting": "In a meeting until {zeit}",
+        "haus": "Working from home", "unterwegs": "On the road", "abwesend": "Away",
+        "feierabend_anfang": "Off work, back ",
+        "feierabend": "Off work, back at {von}",
+        "feierabend_tag": "Off work, back {tag} {von}",
+        "wochentage": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+        "kal_fehlt": "no calendar credentials in {pfad}, no meeting/vacation status",
+        "kal_weg": "calendar unreachable ({e}), using last result",
+        "kal_gelesen": "calendar read: {n} events, {g} all-day",
+        "w_da": "watchdog reachable", "w_code": "watchdog answers {code}",
+        "w_weg": "watchdog unreachable: {e}",
+        "sichtbar": "presence visible", "unsichtbar": "presence invisible",
+        "hand_bleibt": "status set by hand ('{text}'), keeping it",
+        "hand_weg": "status from a previous day ('{text}') cleared",
+        "status": "status: '{text}'", "status_leer": "status cleared",
+        "beendet": "{name} ended",
+        "keine_sitzung": "no graphical session, nothing to do",
+        "gesperrt": "locked", "entsperrt": "unlocked", "kein_status": "no status",
+        "schlaf": "machine is going to sleep",
+        "wache_aus": "sleep delay not active: {e}", "wache_alt": "sleep delay not renewed: {e}",
+        "sperrgrund": "Set Zulip status before sleep",
+        "cli_auto": "Zulip status follows the automatic again.",
+        "cli_aufruf": "Usage: zulip-status {art} [MINUTES]",
+        "cli_bis": "{name} until {zeit}.",
+        "cli_pause": "Break until you unlock again after a lock (at the latest end of work).",
+        "cli_fokus": "Focusing until end of work or 'zulip-status auto'.",
+        "schlaf_fehler": "not set before sleep: {e}",
+        "kein_schluessel": "no key in {pfad}, waiting",
+        "zulip_code": "Zulip answers {code}: {text}", "zulip_weg": "Zulip unreachable: {e}",
+        "ende_fehler": "not set at exit: {e}",
+        "krank": "Sick", "krank_bis": "Sick until {tag}",
+        "krank_ende": "sick status ended", "urlaub_ende": "vacation ended",
+        "keine_sitzung_ende": "no session during this run, no farewell needed",
+        "freigabe_fehler": "sleep release not written: {e}",
+        "cli_tag_aufruf": "Usage: zulip-status {art} YYYY-MM-DD (today or later)",
+        "cli_urlaub_aufruf": "Usage: zulip-status urlaub YYYY-MM-DD",
+        "cli_urlaub": "On vacation until {tag}, even while the machine is off.",
+        "cli_krank_bis": "Sick until {tag}, even while the machine is off.",
+        "cli_krank": "Sick until 'zulip-status auto', even while the machine is off.",
+    },
+}
+
+
+def t(name, **werte):
+    return TEXTE[SPRACHE][name].format(**werte)
+
+
+def log(text):
+    print(text, flush=True)
+
+
+def zugang():
+    cp = configparser.ConfigParser(interpolation=None)
+    if not cp.read(RC) or not cp.has_section("api"):
+        return None
+    a = cp["api"]
+    email, key, site = a.get("email", ""), a.get("key", ""), a.get("site", "")
+    if not email or not key or not site or any(p in email + key for p in PLATZHALTER):
+        return None
+    return email.strip(), key.strip(), site.strip().rstrip("/")
+
+
+class Zulip:
+    def __init__(self, email, key, site):
+        self.site = site
+        self.auth = "Basic " + base64.b64encode(f"{email}:{key}".encode()).decode()
+        self.user_id = None
+        self.frist = 10
+
+    def ruf(self, methode, pfad, **daten):
+        if TROCKEN and methode != "GET":
+            log(f"[dry-run] {methode} {pfad} {daten}")
+            return {}
+        body = urllib.parse.urlencode(daten).encode() if daten else None
+        req = urllib.request.Request(f"{self.site}/api/v1{pfad}", data=body, method=methode)
+        req.add_header("Authorization", self.auth)
+        req.add_header("User-Agent", "zulip-status (Desktop-Zustand)")
+        with urllib.request.urlopen(req, timeout=self.frist) as r:
+            return json.load(r)
+
+    def status(self):
+        """Aktueller eigener Status als (Text, Emoji-Name)."""
+        if self.user_id is None:
+            self.user_id = self.ruf("GET", "/users/me")["user_id"]
+        s = self.ruf("GET", f"/users/{self.user_id}/status").get("status", {})
+        return s.get("status_text", ""), s.get("emoji_name", "")
+
+
+class Kalender:
+    """Heutige Termine aus einem CalDAV-Kalender, alle KALENDER_TAKT Sekunden."""
+
+    def __init__(self):
+        self.termine = []        # (start, ende, titel) lokal, mit Uhrzeit
+        self.ganztags = []       # (erster Tag, letzter Tag, titel)
+        self.geholt = 0
+        self.gemeldet = None
+
+    def zugang(self):
+        cp = configparser.ConfigParser(interpolation=None)
+        if not cp.read(KALENDER_RC) or not cp.has_section("caldav"):
+            return None
+        c = cp["caldav"]
+        if not c.get("url") or not c.get("user") or not c.get("password"):
+            return None
+        return c["url"].strip(), c["user"].strip(), c["password"].strip()
+
+    def melde(self, text):
+        if text != self.gemeldet:
+            log(text)
+            self.gemeldet = text
+
+    def hole(self):
+        if time.monotonic() - self.geholt < KALENDER_TAKT and self.geholt:
+            return
+        self.geholt = time.monotonic()
+        zg = self.zugang()
+        if zg is None:
+            self.termine, self.ganztags = [], []
+            self.melde(t("kal_fehlt", pfad=KALENDER_RC))
+            return
+        url, user, pw = zg
+        heute = datetime.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        utc = datetime.timezone.utc
+        a = heute.astimezone(utc).strftime("%Y%m%dT%H%M%SZ")
+        b = (heute + datetime.timedelta(days=1)).astimezone(utc).strftime("%Y%m%dT%H%M%SZ")
+        # expand: Serientermine kommen sonst nur mit dem DTSTART der Serie
+        xml = (f'<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop>'
+               f'<c:calendar-data><c:expand start="{a}" end="{b}"/></c:calendar-data></d:prop>'
+               f'<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">'
+               f'<c:time-range start="{a}" end="{b}"/></c:comp-filter></c:comp-filter></c:filter>'
+               f'</c:calendar-query>')
+        req = urllib.request.Request(url, data=xml.encode(), method="REPORT")
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode())
+        req.add_header("Depth", "1")
+        req.add_header("Content-Type", "application/xml; charset=utf-8")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                roh = r.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, OSError) as e:
+            self.melde(t("kal_weg", e=e))
+            return
+        self.termine, self.ganztags = self.lese(roh)
+        self.melde(t("kal_gelesen", n=len(self.termine), g=len(self.ganztags)))
+
+    @staticmethod
+    def lese(roh):
+        roh = (roh.replace("&#13;", "").replace("&lt;", "<").replace("&gt;", ">")
+               .replace("&quot;", '"').replace("&amp;", "&"))
+        roh = re.sub(r"\r?\n[ \t]", "", roh)                 # gefaltete Zeilen
+        termine, ganztags = [], []
+        # nur VEVENT: in VTIMEZONE steht auch ein DTSTART
+        for block in re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", roh, re.S):
+            f = {}
+            for zeile in block.splitlines():
+                if ":" in zeile:
+                    kopf, wert = zeile.split(":", 1)
+                    f.setdefault(kopf.split(";")[0].upper(), (kopf, wert.strip()))
+            if "DTSTART" not in f or f.get("STATUS", ("", ""))[1].upper() == "CANCELLED":
+                continue
+            titel = f.get("SUMMARY", ("", ""))[1].replace("\\,", ",").replace("\\;", ";")
+            kopf, start = f["DTSTART"]
+            ende = f.get("DTEND", (kopf, start))[1]
+            if "VALUE=DATE" in kopf.upper() or len(start) == 8:
+                s = datetime.datetime.strptime(start[:8], "%Y%m%d").date()
+                e = datetime.datetime.strptime(ende[:8], "%Y%m%d").date() - datetime.timedelta(days=1)
+                ganztags.append((s, max(s, e), titel))
+                continue
+            if f.get("TRANSP", ("", ""))[1].upper() == "TRANSPARENT":
+                continue                                     # als "frei" markiert
+            try:
+                termine.append((Kalender.zeit(start), Kalender.zeit(ende), titel))
+            except ValueError:
+                continue
+        return termine, ganztags
+
+    @staticmethod
+    def zeit(wert):
+        t = datetime.datetime.strptime(wert[:15], "%Y%m%dT%H%M%S")
+        if wert.endswith("Z"):
+            t = t.replace(tzinfo=datetime.timezone.utc).astimezone().replace(tzinfo=None)
+        return t
+
+    def meeting_bis(self, jetzt):
+        """Ende des laufenden Termins; bei Ueberlappung das spaeteste."""
+        enden = [e for s, e, _ in self.termine if s <= jetzt < e]
+        return max(enden) if enden else None
+
+    def urlaub_bis(self, heute):
+        tage = [e for s, e, titel in self.ganztags if s <= heute <= e and URLAUB_WORT in titel.lower()]
+        return max(tage) if tage else None
+
+
+def gesperrt():
+    """True/False; None, wenn keine grafische Sitzung erreichbar ist."""
+    try:
+        out = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.ScreenSaver", "/ScreenSaver",
+             "org.freedesktop.ScreenSaver", "GetActive"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip().endswith("true")
+
+
+def im_heimnetz():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    for adr in re.findall(r"inet (\S+?)/", out):
+        if any(ipaddress.ip_address(adr) in n for n in HEIMNETZE):
+            return True
+    return not HEIMNETZE
+
+
+def arbeitszeit(jetzt=None):
+    jetzt = jetzt or datetime.datetime.now()
+    return jetzt.weekday() < 5 and VON <= jetzt.strftime("%H:%M") < BIS
+
+
+def feierabend_text(jetzt):
+    """Naechster Arbeitsbeginn; Urlaub und Feiertage kennt die Rechnung nicht."""
+    tag = jetzt.date()
+    if not (jetzt.weekday() < 5 and jetzt.strftime("%H:%M") < VON):
+        tag += datetime.timedelta(days=1)
+    while tag.weekday() >= 5:
+        tag += datetime.timedelta(days=1)
+    if tag - jetzt.date() <= datetime.timedelta(days=1):
+        return t("feierabend", von=VON)
+    return t("feierabend_tag", tag=TEXTE[SPRACHE]["wochentage"][tag.weekday()], von=VON)
+
+
+def vom_waechter(ist):
+    """Status, den der Waechter nach seiner Standardregel gesetzt hat (jede Sprache)."""
+    return any(ist == (s["abwesend"], EMOJI["abwesend"][0]) or (
+        ist[1] == EMOJI["feierabend"][0] and ist[0].startswith(s["feierabend_anfang"]))
+        for s in TEXTE.values())
+
+
+class Waechter:
+    """Lebenszeichen an den Totmann (docs/watchdog.md). Bleibt es aus (Absturz, hartes
+    Aus, Netz weg), setzt er Abwesend bzw. Feierabend und schaltet unsichtbar."""
+
+    def __init__(self):
+        self.stand = None
+
+    def zugang(self):
+        cp = configparser.ConfigParser(interpolation=None)
+        if not cp.read(WAECHTER_RC) or not cp.has_section("waechter"):
+            return None
+        w = cp["waechter"]
+        url, token = w.get("url", "").strip(), w.get("token", "").strip()
+        return (url, token) if url and token else None
+
+    def sage(self, text):
+        if text != self.stand:
+            log(text)
+            self.stand = text
+
+    def melde(self, status, notfall=None, gueltig=WAECHTER_GUELTIG, frist=5):
+        zg = self.zugang()
+        if TROCKEN or zg is None:
+            return
+        daten = {"gueltig_s": gueltig, "status": {"text": status[0], "emoji_name": status[1]}}
+        if notfall:
+            daten["notfall"] = notfall
+        req = urllib.request.Request(zg[0], data=json.dumps(daten).encode(), method="POST")
+        req.add_header("Authorization", f"Bearer {zg[1]}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "zulip-status (Desktop-Zustand)")
+        try:
+            with urllib.request.urlopen(req, timeout=frist) as r:
+                r.read()
+            self.sage(t("w_da"))
+        except urllib.error.HTTPError as e:
+            self.sage(t("w_code", code=e.code))
+        except (urllib.error.URLError, OSError) as e:
+            self.sage(t("w_weg", e=e))
+
+
+class Regler:
+    def __init__(self):
+        self.waechter = Waechter()
+        self.sichtbar = None       # zuletzt gesetztes presence_enabled
+        self.sichtbar_zeit = 0.0   # wann gesetzt (Wanduhr, zaehlt auch im Schlaf)
+        self.sichtbar_log = None
+        self.letzte_runde = 0.0    # letzte gelungene Runde (Wanduhr)
+        self.sitzung = False       # in diesem Lauf je eine grafische Sitzung gesehen
+        self.gesperrt_seit = None  # monotonic
+        self.gemeldet = None
+        self.kalender = Kalender()
+        self.eigen = LEER          # zuletzt von uns gesetzter Status
+        self.aufgeraeumt = ""      # Tag, an dem Handeintraege zuletzt geraeumt wurden
+        try:
+            with open(MERKER) as fh:
+                m = json.load(fh)
+            self.eigen = (m.get("text", ""), m.get("emoji", ""))
+            self.aufgeraeumt = m.get("aufgeraeumt", "")
+        except (OSError, ValueError):
+            pass
+
+    def merke(self):
+        if TROCKEN:
+            return
+        os.makedirs(os.path.dirname(MERKER), exist_ok=True)
+        with open(MERKER, "w") as fh:
+            json.dump({"text": self.eigen[0], "emoji": self.eigen[1], "aufgeraeumt": self.aufgeraeumt}, fh)
+
+    def melde(self, text):
+        if text != self.gemeldet:
+            log(text)
+            self.gemeldet = text
+
+    def setze_sichtbar(self, z, an):
+        # Der Server gibt presence_enabled nicht einzeln heraus (GET /settings: 405).
+        # Der Waechter oder ein anderer Client kann es umgestellt haben, deshalb gilt
+        # der Merker nur begrenzt und nicht ueber eine Luecke (Schlaf, Netz weg) hinweg.
+        jetzt = time.time()
+        if jetzt - self.sichtbar_zeit > SICHTBAR_NEU or jetzt - self.letzte_runde > 2 * TAKT:
+            self.sichtbar = None
+        if self.sichtbar != an:
+            z.ruf("PATCH", "/settings", presence_enabled="true" if an else "false")
+            self.sichtbar, self.sichtbar_zeit = an, jetzt
+            if self.sichtbar_log != an:
+                log(t("sichtbar" if an else "unsichtbar"))
+                self.sichtbar_log = an
+
+    def setze_status(self, z, text, art, raeumen=False):
+        """Status setzen; ein Handeintrag bleibt, ausser raeumen ist erlaubt."""
+        soll = (text, EMOJI[art][0] if art else "")
+        ist = z.status()
+        if ist == soll:
+            if self.eigen != soll:
+                self.eigen = soll
+                self.merke()
+            return
+        if ist != LEER and ist != self.eigen and not vom_waechter(ist):
+            if not raeumen or ist[1] in BLEIBT_IMMER:
+                self.melde(t("hand_bleibt", text=ist[0]))
+                return
+            log(t("hand_weg", text=ist[0]))
+        daten = {"status_text": text, "emoji_name": soll[1]}
+        if art:
+            daten.update(emoji_code=EMOJI[art][1], reaction_type="unicode_emoji")
+        z.ruf("POST", "/users/me/status", **daten)
+        log(t("status", text=text) if text else t("status_leer"))
+        self.eigen = soll
+        self.merke()
+
+    def hand(self, sperre, jetzt):
+        """Per Befehl gesetzte Pause/Konzentration als (Text, Art) oder None."""
+        try:
+            with open(HAND) as fh:
+                h = json.load(fh)
+            art, bis = h["art"], h.get("bis")
+        except (OSError, ValueError, KeyError):
+            return None
+        if art not in ("pause", "fokus"):
+            return None
+        name = t(art)
+        if bis:
+            if jetzt.timestamp() < bis:
+                return t("bis", name=name, zeit=f"{datetime.datetime.fromtimestamp(bis):%H:%M}"), art
+        elif arbeitszeit(jetzt):
+            # ohne Dauer: die Pause endet mit dem Zurueckkommen an den Rechner
+            if sperre and not h.get("gesperrt"):
+                h["gesperrt"] = True
+                with open(HAND, "w") as fh:
+                    json.dump(h, fh)
+            if not (art == "pause" and h.get("gesperrt") and not sperre):
+                return name, art
+        try:
+            os.remove(HAND)
+        except OSError:
+            pass
+        log(t("beendet", name=name))
+        return None
+
+    def abwesenheit(self, jetzt):
+        """Per Befehl gesetztes Krank/Urlaub als (Text, Art) oder None."""
+        try:
+            with open(HAND) as fh:
+                h = json.load(fh)
+            art, bis = h["art"], h.get("bis")
+            tag = datetime.date.fromisoformat(bis) if bis else None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if art not in ("krank", "urlaub"):
+            return None
+        if tag is None or jetzt.date() <= tag:
+            if art == "urlaub":
+                return t("urlaub", tag=tag.strftime(t("datum"))), art
+            return (t("krank_bis", tag=tag.strftime(t("datum"))) if tag else t("krank")), art
+        try:
+            os.remove(HAND)
+        except OSError:
+            pass
+        log(t("krank_ende" if art == "krank" else "urlaub_ende"))
+        return None
+
+    def wunsch(self, sperre, jetzt):
+        """(Text, Art) fuer den aktuellen Zustand; None = nichts aendern."""
+        weg = self.abwesenheit(jetzt)
+        if weg:
+            return weg
+        hand = self.hand(sperre, jetzt)
+        if hand:
+            return hand
+        urlaub = self.kalender.urlaub_bis(jetzt.date())
+        if urlaub:
+            return t("urlaub", tag=urlaub.strftime(t("datum"))), "urlaub"
+        meeting = self.kalender.meeting_bis(jetzt)
+        if meeting:
+            return t("meeting", zeit=f"{meeting:%H:%M}"), "meeting"
+        if not sperre:
+            if not arbeitszeit(jetzt):
+                return "", None
+            return (t("haus"), "haus") if im_heimnetz() else (t("unterwegs"), "unterwegs")
+        if not arbeitszeit(jetzt):
+            return feierabend_text(jetzt), "feierabend"
+        if time.monotonic() - self.gesperrt_seit >= UNSICHTBAR_NACH:
+            return t("abwesend"), "abwesend"
+        return None
+
+    def notfall(self, jetzt, auch_hand=False):
+        """Was der Waechter statt seiner Standardregel setzen soll, oder None."""
+        w = self.abwesenheit(jetzt) or (self.hand(True, jetzt) if auch_hand else None)
+        if not w:
+            urlaub = self.kalender.urlaub_bis(jetzt.date())
+            w = (t("urlaub", tag=urlaub.strftime(t("datum"))), "urlaub") if urlaub else None
+        if not w:
+            return None
+        return {"text": w[0], "emoji_name": EMOJI[w[1]][0], "emoji_code": EMOJI[w[1]][1], "sichtbar": False}
+
+    def runde(self, z):
+        sperre = gesperrt()
+        if sperre is None:
+            self.melde(t("keine_sitzung"))
+            return
+        self.sitzung = True
+        jetzt = datetime.datetime.now()
+        self.kalender.hole()
+        raeumen = False
+        if not sperre:
+            self.gesperrt_seit = None
+            # Nach der Arbeitszeit unsichtbar, auch wenn am Rechner gearbeitet wird.
+            if arbeitszeit(jetzt):
+                self.setze_sichtbar(z, True)
+                z.ruf("POST", "/users/me/presence", status="active", new_user_input="true", ping_only="true")
+            else:
+                self.setze_sichtbar(z, False)
+            heute = jetzt.strftime("%Y-%m-%d")
+            if self.aufgeraeumt != heute:
+                raeumen = bool(self.aufgeraeumt)   # erster Lauf ueberhaupt: nichts raeumen
+                self.aufgeraeumt = heute
+                self.merke()
+        else:
+            if self.gesperrt_seit is None:
+                self.gesperrt_seit = time.monotonic()
+            if time.monotonic() - self.gesperrt_seit >= UNSICHTBAR_NACH:
+                self.setze_sichtbar(z, False)
+        w = self.wunsch(sperre, jetzt)
+        if w is not None:
+            self.setze_status(z, *w, raeumen=raeumen)
+        self.melde(t("gesperrt" if sperre else "entsperrt") + (f": {w[0] or t('kein_status')}" if w else ""))
+        self.letzte_runde = time.time()
+        self.waechter.melde(self.eigen, self.notfall(jetzt))
+
+    def schlaf(self, z):
+        """Vor Bereitschaft/Ruhezustand: danach kann der Rechner nichts mehr melden."""
+        if gesperrt() is None:
+            return
+        jetzt = datetime.datetime.now()
+        log(t("schlaf"))
+        z.frist = 3              # logind wartet hoechstens 5 s auf uns
+        # zuerst der Abschied: kommt das Folgende nicht mehr durch, setzt es der Waechter
+        self.waechter.melde(self.eigen, self.notfall(jetzt, auch_hand=True), WAECHTER_ABSCHIED, frist=2)
+        try:
+            if not (self.abwesenheit(jetzt) or self.hand(True, jetzt) or self.kalender.urlaub_bis(jetzt.date())):
+                if arbeitszeit(jetzt):
+                    self.setze_status(z, t("abwesend"), "abwesend")
+                else:
+                    self.setze_status(z, feierabend_text(jetzt), "feierabend")
+            self.setze_sichtbar(z, False)
+        finally:
+            z.frist = 10
+            self.gemeldet = None
+
+    def ende(self, z):
+        """Dienstende (Abmelden/Herunterfahren): Feierabend bzw. Status weg."""
+        # Kein Blick auf gesperrt(): beim Herunterfahren ist die Bildschirmsperre
+        # meist schon beendet, das Netz steht aber noch.
+        if not self.sitzung:
+            # Nur Anmeldebildschirm (Linger startet den Dienst schon beim Booten):
+            # nichts gesetzt, nichts gemeldet.
+            log(t("keine_sitzung_ende"))
+            return
+        jetzt = datetime.datetime.now()
+        self.waechter.melde(self.eigen, self.notfall(jetzt), WAECHTER_ABSCHIED, frist=2)
+        if self.abwesenheit(jetzt) or self.kalender.urlaub_bis(jetzt.date()):
+            return
+        if arbeitszeit(jetzt):
+            self.setze_status(z, "", None)
+        else:
+            self.setze_status(z, feierabend_text(jetzt), "feierabend")
+
+
+SCHLAF_FERTIG = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                             "zulip-status-schlaf")
+
+
+def fertig_melden():
+    """Gibt dem NetworkManager-Hook (nm/) frei: das Netz darf jetzt weg."""
+    try:
+        with open(SCHLAF_FERTIG, "w") as fh:
+            fh.write(datetime.datetime.now().isoformat() + "\n")
+    except OSError as e:
+        log(t("freigabe_fehler", e=e))
+
+
+class Schlafwache:
+    """Verzoegerungssperre bei logind: vor dem Einschlafen noch den Status setzen."""
+
+    def __init__(self, vorher, nachher):
+        self.vorher, self.nachher = vorher, nachher
+        self.fd = None
+
+    def starte(self):
+        try:
+            from gi.repository import Gio, GLib
+            self.Gio, self.GLib = Gio, GLib
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+            self.bus.signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE, self.signal)
+            self.sperre()
+        except Exception as e:  # ohne die Sperre laeuft der Dienst wie bisher
+            log(t("wache_aus", e=e))
+            return
+        threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
+
+    def sperre(self):
+        antwort, fds = self.bus.call_with_unix_fd_list_sync(
+            "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+            "Inhibit",
+            self.GLib.Variant("(ssss)", ("sleep", "zulip-status", t("sperrgrund"), "delay")),
+            self.GLib.VariantType("(h)"), self.Gio.DBusCallFlags.NONE, -1, None, None)
+        self.fd = fds.steal_fds()[antwort.unpack()[0]]
+
+    def signal(self, _bus, _sender, _pfad, _iface, _name, param):
+        if param.unpack()[0]:
+            try:
+                self.vorher()
+            finally:                 # erst das Schliessen laesst den Rechner einschlafen
+                fertig_melden()
+                if self.fd is not None:
+                    os.close(self.fd)
+                    self.fd = None
+        else:
+            try:
+                self.sperre()
+            except Exception as e:
+                log(t("wache_alt", e=e))
+            self.nachher()
+
+
+def befehl(args):
+    """pause/fokus/krank/urlaub/auto von der Kommandozeile; der Dienst setzt den Status."""
+    art = args[0]
+    if art in ("krank", "urlaub"):
+        tag = None
+        if len(args) > 1:
+            try:
+                tag = datetime.date.fromisoformat(args[1])
+            except ValueError:
+                tag = None
+            if tag is None or tag < datetime.date.today():
+                sys.exit(t("cli_tag_aufruf", art=art))
+        elif art == "urlaub":
+            sys.exit(t("cli_urlaub_aufruf"))
+        os.makedirs(os.path.dirname(HAND), exist_ok=True)
+        with open(HAND, "w") as fh:
+            json.dump({"art": art, "bis": tag.isoformat() if tag else None}, fh)
+        if art == "urlaub":
+            print(t("cli_urlaub", tag=tag.strftime(t("datum"))))
+        else:
+            print(t("cli_krank_bis", tag=tag.strftime(t("datum"))) if tag else t("cli_krank"))
+    elif art == "auto":
+        try:
+            os.remove(HAND)
+        except OSError:
+            pass
+        print(t("cli_auto"))
+    else:
+        bis = None
+        if len(args) > 1:
+            try:
+                minuten = int(args[1])
+            except ValueError:
+                minuten = 0
+            if minuten <= 0:
+                sys.exit(t("cli_aufruf", art=art))
+            bis = int(time.time()) + minuten * 60
+        os.makedirs(os.path.dirname(HAND), exist_ok=True)
+        with open(HAND, "w") as fh:
+            json.dump({"art": art, "bis": bis}, fh)
+        name = t(art)
+        if bis:
+            print(t("cli_bis", name=name, zeit=f"{datetime.datetime.fromtimestamp(bis):%H:%M}"))
+        elif art == "pause":
+            print(t("cli_pause"))
+        else:
+            print(t("cli_fokus"))
+    subprocess.run(["systemctl", "--user", "kill", "-s", "USR1", DIENST], capture_output=True)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("pause", "fokus", "krank", "urlaub", "auto"):
+        return befehl(sys.argv[1:])
+    regler = Regler()
+    stop, weck = [], []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    signal.signal(signal.SIGUSR1, lambda *_: weck.append(1))
+    z = None
+    aktuell, riegel = {}, threading.Lock()
+
+    def vor_dem_schlafen():
+        zz = aktuell.get("z")
+        if zz is None or not riegel.acquire(timeout=3):
+            return
+        try:
+            regler.schlaf(zz)
+        except Exception as e:  # das Netz kann schon weg sein
+            log(t("schlaf_fehler", e=e))
+        finally:
+            riegel.release()
+
+    if not TROCKEN:
+        Schlafwache(vor_dem_schlafen, lambda: weck.append(1)).starte()
+    while not stop:
+        zg = zugang()
+        if zg is None:
+            regler.melde(t("kein_schluessel", pfad=RC))
+            z = None
+        else:
+            if z is None or (z.site, z.auth) != (zg[2], Zulip(*zg).auth):
+                z = Zulip(*zg)
+            try:
+                with riegel:
+                    regler.runde(z)
+            except urllib.error.HTTPError as e:
+                regler.melde(t("zulip_code", code=e.code, text=e.read(200).decode(errors="replace")))
+            except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+                regler.melde(t("zulip_weg", e=e))
+        aktuell["z"] = z
+        if TROCKEN:
+            return
+        for _ in range(TAKT):
+            if stop or weck:
+                break
+            time.sleep(1)
+        weck.clear()
+    if z is not None:
+        try:
+            regler.ende(z)
+        except Exception as e:  # beim Herunterfahren ist das Netz oft schon weg
+            log(t("ende_fehler", e=e))
+
+
+if __name__ == "__main__":
+    main()

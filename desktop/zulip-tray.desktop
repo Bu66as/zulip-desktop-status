@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Zulip status (tray)
+Name[de]=Zulip-Status (Tray)
+Comment=Choose break and focus for Zulip from the system tray
+Comment[de]=Pause und Konzentriert für Zulip im Systemabschnitt wählen
+Exec=zulip-tray
+Icon=user-available
+Terminal=false
+Categories=Network;Utility;
+X-GNOME-Autostart-enabled=true

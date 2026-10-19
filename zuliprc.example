@@ -1,0 +1,4 @@
+[api]
+email=YOUR_LOGIN_ADDRESS
+key=YOUR_API_KEY
+site=https://zulip.example.org

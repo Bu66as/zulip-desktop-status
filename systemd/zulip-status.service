@@ -1,0 +1,13 @@
+[Unit]
+Description=Zulip presence and status from the desktop state
+ConditionPathExists=%h/.zuliprc
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/zulip-status
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

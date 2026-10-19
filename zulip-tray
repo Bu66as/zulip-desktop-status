@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Michael Maurer
+"""Tray switch for the Zulip status.
+
+Shows in the system tray what the zulip-status service has currently set in
+Zulip and lets you choose break and focus (with or without duration) as well
+as sick and vacation (up to a date) by hand. The tray sets nothing in Zulip
+itself, it only calls zulip-status pause|fokus|krank|urlaub|auto.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+
+from PySide6.QtCore import QDate, QTimer
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import (QApplication, QCalendarWidget, QDialog, QDialogButtonBox,
+                               QGridLayout, QLabel, QMenu, QPushButton, QSystemTrayIcon,
+                               QVBoxLayout)
+
+HIER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "zulip-status")
+BEFEHL = HIER if os.path.exists(HIER) else (shutil.which("zulip-status") or "zulip-status")
+KONFIG = os.path.expanduser("~/.config/zulip-status/config.env")
+MERKER = os.path.expanduser("~/.local/state/zulip-status.json")
+HAND = os.path.expanduser("~/.local/state/zulip-status-hand.json")
+PAUSE_MIN = (15, 30, 45, 60)
+FOKUS_MIN = (30, 60, 90, 120)
+SYMBOL = {"pause": "user-away", "fokus": "user-busy", "krank": "user-offline",
+          "urlaub": "user-offline", None: "user-available"}
+TAGE = ("krank", "urlaub")   # gelten bis zu einem Datum statt bis zu einer Uhrzeit
+
+
+def sprache():
+    """ZULIP_STATUS_LANG aus Umgebung oder KONFIG, sonst aus der Locale."""
+    wahl = os.environ.get("ZULIP_STATUS_LANG", "")
+    if not wahl:
+        try:
+            with open(KONFIG) as fh:
+                for zeile in fh:
+                    if zeile.strip().startswith("ZULIP_STATUS_LANG="):
+                        wahl = zeile.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    wahl = wahl or next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
+    return "de" if wahl.lower().startswith("de") else "en"
+
+
+TEXTE = {
+    "de": {"pause": "Pause", "fokus": "Konzentriert", "auto": "Automatik", "titel": "Zulip-Status",
+           "offen_pause": "bis ich wieder entsperre", "offen_fokus": "bis Arbeitsende",
+           "minuten": "{n} Minuten", "beenden": "Beenden", "leer": "kein Status-Text",
+           "bis": " bis {zeit}", "krank": "Krank", "urlaub": "Im Urlaub",
+           "heute": "heute", "bis_morgen": "bis morgen", "bis_datum": "bis Datum …",
+           "bis_ende": "bis ich es beende", "urlaub_bis": "Urlaub bis …",
+           "krank_titel": "Krank bis", "urlaub_titel": "Urlaub bis",
+           "letzter_tag": "{titel}, letzter Tag der Abwesenheit:", "datum": "%d.%m."},
+    "en": {"pause": "Break", "fokus": "Focusing", "auto": "Automatic", "titel": "Zulip status",
+           "offen_pause": "until I unlock again", "offen_fokus": "until end of work",
+           "minuten": "{n} minutes", "beenden": "Quit", "leer": "no status text",
+           "bis": " until {zeit}", "krank": "Sick", "urlaub": "On vacation",
+           "heute": "today", "bis_morgen": "until tomorrow", "bis_datum": "until date …",
+           "bis_ende": "until I end it", "urlaub_bis": "Vacation until …",
+           "krank_titel": "Sick until", "urlaub_titel": "Vacation until",
+           "letzter_tag": "{titel}, last day of absence:", "datum": "%d %b"},
+}
+T = TEXTE[sprache()]
+NAME = {"pause": T["pause"], "fokus": T["fokus"], "krank": T["krank"], "urlaub": T["urlaub"]}
+
+
+def lies(pfad):
+    try:
+        with open(pfad) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def hand():
+    """Von Hand gesetzter Zustand als (Art, bis) oder (None, None)."""
+    h = lies(HAND)
+    art, bis = h.get("art"), h.get("bis")
+    if art not in NAME:
+        return None, None
+    if art in TAGE:
+        try:
+            bis = date.fromisoformat(bis) if bis else None
+        except (TypeError, ValueError):
+            return None, None
+        if (bis and bis < date.today()) or (art == "urlaub" and not bis):
+            return None, None
+    elif bis and bis <= time.time():
+        return None, None
+    return art, bis
+
+
+def frage_datum(titel):
+    """Letzten Tag der Abwesenheit waehlen; None bei Abbruch."""
+    d = QDialog()
+    d.setWindowTitle(titel)
+    d.setWindowIcon(QIcon.fromTheme("user-offline"))
+    kasten = QVBoxLayout(d)
+    kasten.addWidget(QLabel(T["letzter_tag"].format(titel=titel)))
+    kal = QCalendarWidget()
+    kal.setMinimumDate(QDate.currentDate())
+    kal.setSelectedDate(QDate.currentDate())
+    kasten.addWidget(kal)
+    knoepfe = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    knoepfe.accepted.connect(d.accept)
+    knoepfe.rejected.connect(d.reject)
+    kasten.addWidget(knoepfe)
+    if d.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return kal.selectedDate().toString("yyyy-MM-dd")
+
+
+class Fenster(QDialog):
+    """Auswahl fuer den Linksklick.
+
+    Unter Wayland darf ein Programm ohne eigenes Fenster kein Menue aufklappen
+    ("Failed to create grabbing popup"); das Kontextmenue zeichnet Plasma
+    selbst, den Linksklick nicht. Deshalb hier ein kleines Fenster.
+    """
+
+    def __init__(self, tray):
+        super().__init__()
+        self.setWindowTitle(T["titel"])
+        self.setWindowIcon(QIcon.fromTheme("user-available"))
+        gitter = QGridLayout(self)
+        self.kopf = QLabel()
+        gitter.addWidget(self.kopf, 0, 0, 1, 6)
+        zeilen = ((T["pause"], "pause", PAUSE_MIN, T["offen_pause"]),
+                  (T["fokus"], "fokus", FOKUS_MIN, T["offen_fokus"]))
+        for z, (titel, art, minuten, offen) in enumerate(zeilen, start=1):
+            gitter.addWidget(QLabel(titel), z, 0)
+            for s, n in enumerate(minuten, start=1):
+                k = QPushButton(f"{n} min")
+                k.clicked.connect(lambda _=False, art=art, n=n: self.waehle(tray, art, n))
+                gitter.addWidget(k, z, s)
+            k = QPushButton(offen)
+            k.clicked.connect(lambda _=False, art=art: self.waehle(tray, art))
+            gitter.addWidget(k, z, 5)
+        gitter.addWidget(QLabel(T["krank"]), 3, 0)
+        for s, (titel, tage) in enumerate(((T["heute"], 0), (T["bis_morgen"], 1)), start=1):
+            k = QPushButton(titel)
+            k.clicked.connect(lambda _=False, tage=tage: self.waehle(
+                tray, "krank", (date.today() + timedelta(days=tage)).isoformat()))
+            gitter.addWidget(k, 3, s)
+        k = QPushButton(T["bis_datum"])
+        k.clicked.connect(lambda: self.waehle(tray, "krank", fragen=T["krank_titel"]))
+        gitter.addWidget(k, 3, 3, 1, 2)
+        k = QPushButton(T["bis_ende"])
+        k.clicked.connect(lambda: self.waehle(tray, "krank"))
+        gitter.addWidget(k, 3, 5)
+        gitter.addWidget(QLabel(T["urlaub"]), 4, 0)
+        k = QPushButton(T["bis_datum"])
+        k.clicked.connect(lambda: self.waehle(tray, "urlaub", fragen=T["urlaub_titel"]))
+        gitter.addWidget(k, 4, 1, 1, 5)
+        self.auto = QPushButton(QIcon.fromTheme("user-available"), T["auto"])
+        self.auto.clicked.connect(lambda: self.waehle(tray, "auto"))
+        gitter.addWidget(self.auto, 5, 0, 1, 6)
+
+    def waehle(self, tray, art, wert=None, fragen=None):
+        self.hide()
+        if fragen:
+            tray.frage(art, fragen)
+        else:
+            tray.setze(art, wert)
+
+
+class Tray(QSystemTrayIcon):
+    def __init__(self):
+        super().__init__()
+        self.menue = QMenu()
+        self.kopf = self.menue.addAction("")
+        self.kopf.setEnabled(False)
+        self.menue.addSeparator()
+        self.untermenue(T["pause"], "pause", PAUSE_MIN, T["offen_pause"])
+        self.untermenue(T["fokus"], "fokus", FOKUS_MIN, T["offen_fokus"])
+        m = self.menue.addMenu(QIcon.fromTheme(SYMBOL["krank"]), T["krank"])
+        for titel, tage in ((T["heute"], 0), (T["bis_morgen"], 1)):
+            m.addAction(titel).triggered.connect(lambda _=False, tage=tage: self.setze(
+                "krank", (date.today() + timedelta(days=tage)).isoformat()))
+        m.addAction(T["bis_datum"]).triggered.connect(lambda: self.frage("krank", T["krank_titel"]))
+        m.addSeparator()
+        m.addAction(T["bis_ende"]).triggered.connect(lambda: self.setze("krank"))
+        self.menue.addAction(QIcon.fromTheme(SYMBOL["urlaub"]), T["urlaub_bis"]).triggered.connect(
+            lambda: self.frage("urlaub", T["urlaub_titel"]))
+        self.menue.addSeparator()
+        self.auto = QAction(QIcon.fromTheme("user-available"), T["auto"], self.menue)
+        self.auto.triggered.connect(lambda: self.setze("auto"))
+        self.menue.addAction(self.auto)
+        self.menue.addSeparator()
+        self.menue.addAction(T["beenden"]).triggered.connect(QApplication.quit)
+        self.setContextMenu(self.menue)
+        self.fenster = Fenster(self)
+        self.activated.connect(self.klick)
+        self.takt = QTimer(self)
+        self.takt.timeout.connect(self.zeige)
+        self.takt.start(5000)
+        self.zeige()
+
+    def untermenue(self, titel, art, minuten, offen):
+        m = self.menue.addMenu(QIcon.fromTheme(SYMBOL[art]), titel)
+        for n in minuten:
+            m.addAction(T["minuten"].format(n=n)).triggered.connect(lambda _=False, n=n: self.setze(art, n))
+        m.addSeparator()
+        m.addAction(offen).triggered.connect(lambda: self.setze(art))
+
+    def frage(self, art, titel):
+        tag = frage_datum(titel)
+        if tag:
+            self.setze(art, tag)
+
+    def setze(self, art, wert=None):
+        """wert: Minuten (Pause/Konzentriert) oder letzter Tag JJJJ-MM-TT (Krank/Urlaub)."""
+        args = [BEFEHL, art] + ([str(wert)] if wert else [])
+        try:
+            subprocess.run(args, capture_output=True, timeout=8)
+        except Exception:  # fehlendes Skript oder Timeout -> nie die GUI killen
+            pass
+        self.zeige()
+        QTimer.singleShot(2500, self.zeige)  # der Dienst braucht einen Moment
+
+    def klick(self, grund):
+        if grund == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.fenster.isVisible():
+                self.fenster.hide()
+            else:
+                self.zeige()
+                self.fenster.show()
+                self.fenster.raise_()
+                self.fenster.activateWindow()
+
+    def zeige(self):
+        art, bis = hand()
+        text = lies(MERKER).get("text") or T["leer"]
+        if art in TAGE:
+            kopf = NAME[art] + (T["bis"].format(zeit=bis.strftime(T["datum"])) if bis else "")
+        elif art:
+            ende = T["bis"].format(zeit=f"{datetime.fromtimestamp(bis):%H:%M}") if bis else ""
+            kopf = f"{NAME[art]}{ende}"
+        else:
+            kopf = T["auto"]
+        self.kopf.setText(f"{kopf} · in Zulip: {text}")
+        self.auto.setEnabled(art is not None)
+        self.fenster.kopf.setText(f"<b>{kopf}</b> · in Zulip: {text}")
+        self.fenster.auto.setEnabled(art is not None)
+        self.setIcon(QIcon.fromTheme(SYMBOL[art]))
+        self.setToolTip(f"{T['titel']}: {kopf}\nIn Zulip: {text}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("zulip-tray")
+    app.setDesktopFileName("zulip-tray")
+    tray = Tray()
+    tray.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

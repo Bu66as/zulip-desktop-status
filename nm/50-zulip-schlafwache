@@ -1,0 +1,24 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Michael Maurer
+# NetworkManager pre-down hook (optional, needs root):
+#   /etc/NetworkManager/dispatcher.d/pre-down.d/50-zulip-schlafwache
+# On suspend NetworkManager takes the network down at once, faster than
+# zulip-status can set the status. NM waits for pre-down scripts, so this one
+# keeps the connection until zulip-status has written its release file,
+# at most 4 s (logind waits only 5 s anyway).
+[[ "$2" == pre-down ]] || exit 0
+# The process is called python3, so match the command line, not the name.
+pgrep -f "^python3 [^ ]*/zulip-status\$" >/dev/null || exit 0
+zustand=$(busctl get-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+  org.freedesktop.NetworkManager State 2>/dev/null)
+[[ "$zustand" == "u 10" ]] || exit 0    # 10 = NM_STATE_ASLEEP, only when going to sleep
+ab=$(( $(date +%s) - 5 ))
+for _ in $(seq 40); do
+  for f in /run/user/*/zulip-status-schlaf; do
+    [[ -e "$f" ]] && (( $(stat -c %Y "$f") >= ab )) && exit 0
+  done
+  sleep 0.1
+done
+logger -t zulip-schlafwache-netz "no release from zulip-status after 4 s, network goes down anyway"
+exit 0
